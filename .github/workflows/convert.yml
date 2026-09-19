@@ -1,0 +1,319 @@
+name: Convert Media
+
+on:
+  # 首次使用时，在 GitHub Actions 页面手动运行
+  # 会扫描整个仓库
+  workflow_dispatch:
+
+  # 以后每次 push 自动增量处理
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ============================================================
+      # 安装转换工具
+      # ============================================================
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y webp ffmpeg
+
+      # ============================================================
+      # 判断运行模式
+      #
+      # workflow_dispatch = 第一次全量扫描
+      # push              = 增量处理
+      # ============================================================
+
+      - name: Determine conversion mode
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=all" >> "$GITHUB_OUTPUT"
+            echo "Running in FULL conversion mode."
+          else
+            echo "mode=changed" >> "$GITHUB_OUTPUT"
+            echo "Running in INCREMENTAL conversion mode."
+          fi
+
+      # ============================================================
+      # 转换媒体
+      # ============================================================
+
+      - name: Convert media
+        shell: bash
+        env:
+          IMAGE_QUALITY: 82
+          GIF_QUALITY: 80
+          VIDEO_CRF: 32
+          VIDEO_FPS: 15
+          MAX_VIDEO_SIZE: 1920
+        run: |
+          set -euo pipefail
+
+          files=()
+
+          # ==========================================================
+          # 获取需要处理的文件
+          # ==========================================================
+
+          if [ "${{ steps.mode.outputs.mode }}" = "all" ]; then
+
+            echo "Scanning entire repository..."
+
+            while IFS= read -r -d '' file; do
+              files+=("$file")
+            done < <(
+              find . \
+                -type f \
+                ! -path './.git/*' \
+                ! -path './.github/*' \
+                \( \
+                  -iname '*.jpg' \
+                  -o -iname '*.jpeg' \
+                  -o -iname '*.png' \
+                  -o -iname '*.gif' \
+                  -o -iname '*.bmp' \
+                  -o -iname '*.tif' \
+                  -o -iname '*.tiff' \
+                  -iname '*.avif' \
+                  -o -iname '*.avi' \
+                  -o -iname '*.mp4' \
+                  -o -iname '*.mov' \
+                  -o -iname '*.mkv' \
+                  -o -iname '*.webm' \
+                \) \
+                -print0
+            )
+
+          else
+
+            echo "Finding changed media files..."
+
+            # 获取这次 push 涉及的所有 commit
+            while IFS= read -r -d '' file; do
+
+              [ -f "$file" ] || continue
+
+              case "${file,,}" in
+
+                *.jpg|*.jpeg|*.png|*.gif|*.bmp|*.tif|*.tiff|*.avif)
+                  files+=("$file")
+                  ;;
+
+                *.avi|*.mp4|*.mov|*.mkv)
+                  files+=("$file")
+                  ;;
+
+                # 已经是 WebP / WebM，不再处理
+                *.webp|*.webm)
+                  ;;
+
+              esac
+
+            done < <(
+              git diff-tree \
+                --no-commit-id \
+                --name-only \
+                -r \
+                -z \
+                "${{ github.event.before }}" \
+                "${{ github.sha }}"
+            )
+
+          fi
+
+          echo
+          echo "Files found: ${#files[@]}"
+          echo
+
+          # ==========================================================
+          # 去重
+          # ==========================================================
+
+          declare -A seen
+
+          for file in "${files[@]}"; do
+
+            [ -n "$file" ] || continue
+            [ -f "$file" ] || continue
+
+            # 防止同一个文件因为多个 commit 被处理多次
+            if [[ -n "${seen[$file]+x}" ]]; then
+              continue
+            fi
+
+            seen["$file"]=1
+
+            extension="${file##*.}"
+            extension="${extension,,}"
+
+            # ========================================================
+            # 图片 → WebP
+            # ========================================================
+
+            case "$extension" in
+
+              jpg|jpeg|png|bmp|tif|tiff|avif)
+
+                output="${file%.*}.webp"
+
+                echo "========================================"
+                echo "IMAGE"
+                echo "Input : $file"
+                echo "Output: $output"
+                echo "========================================"
+
+                # 如果 WebP 已经存在，并且比原图新，则跳过
+                if [ -f "$output" ] && [ "$output" -nt "$file" ]; then
+                  echo "WebP is already up to date."
+                  continue
+                fi
+
+                cwebp \
+                  -quiet \
+                  -q "$IMAGE_QUALITY" \
+                  -m 6 \
+                  -mt \
+                  "$file" \
+                  -o "$output"
+
+                ;;
+
+              # ======================================================
+              # GIF → 动画 WebP
+              # ======================================================
+
+              gif)
+
+                output="${file%.*}.webp"
+
+                echo "========================================"
+                echo "ANIMATED GIF"
+                echo "Input : $file"
+                echo "Output: $output"
+                echo "========================================"
+
+                if [ -f "$output" ] && [ "$output" -nt "$file" ]; then
+                  echo "WebP is already up to date."
+                  continue
+                fi
+
+                gif2webp \
+                  -q "$GIF_QUALITY" \
+                  -m 6 \
+                  -mt \
+                  "$file" \
+                  -o "$output"
+
+                ;;
+
+              # ======================================================
+              # 视频 → WebM
+              # ======================================================
+
+              avi|mp4|mov|mkv)
+
+                output="${file%.*}.webm"
+
+                echo "========================================"
+                echo "VIDEO"
+                echo "Input : $file"
+                echo "Output: $output"
+                echo "========================================"
+
+                if [ -f "$output" ] && [ "$output" -nt "$file" ]; then
+                  echo "WebM is already up to date."
+                  continue
+                fi
+
+                ffmpeg \
+                  -hide_banner \
+                  -loglevel warning \
+                  -y \
+                  -i "$file" \
+                  -vf "scale='min($MAX_VIDEO_SIZE,iw)':'min($MAX_VIDEO_SIZE,ih)':force_original_aspect_ratio=decrease,fps=$VIDEO_FPS" \
+                  -c:v libvpx-vp9 \
+                  -crf "$VIDEO_CRF" \
+                  -b:v 0 \
+                  -deadline good \
+                  -cpu-used 2 \
+                  -row-mt 1 \
+                  -c:a libopus \
+                  -b:a 96k \
+                  "$output"
+
+                ;;
+
+              # ======================================================
+              # WebP / WebM 不处理
+              # ======================================================
+
+              webp|webm)
+
+                echo "Already converted: $file"
+                ;;
+
+            esac
+
+          done
+
+      # ============================================================
+      # 显示生成结果
+      # ============================================================
+
+      - name: Show changes
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "Git changes"
+          echo "========================================"
+
+          git status --short
+
+      # ============================================================
+      # 提交生成的 WebP / WebM
+      # ============================================================
+
+      - name: Commit generated files
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 只添加生成的媒体文件
+          find . \
+            -type f \
+            \( -iname '*.webp' -o -iname '*.webm' \) \
+            ! -path './.git/*' \
+            -print0 |
+          xargs -0 -r git add --
+
+          # 没有变化
+          if git diff --cached --quiet; then
+            echo "No generated files to commit."
+            exit 0
+          fi
+
+          echo "Committing generated files..."
+
+          git commit -m "chore: generate optimized media"
+
+          git push
